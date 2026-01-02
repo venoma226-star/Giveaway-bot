@@ -27,68 +27,78 @@ DB_PATH = "autopinger.db"
 # ===================== DATABASE =====================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS autopings (
-                            message_id INTEGER PRIMARY KEY,
-                            channel_id INTEGER,
-                            guild_id INTEGER,
-                            header TEXT,
-                            points TEXT,
-                            winner_id INTEGER,
-                            emoji TEXT,
-                            end_time TEXT
-                            )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS autopings (
+            message_id INTEGER PRIMARY KEY,
+            channel_id INTEGER,
+            guild_id INTEGER,
+            header TEXT,
+            points TEXT,
+            winner_id INTEGER,
+            emoji TEXT,
+            end_time TEXT,
+            ended INTEGER DEFAULT 0
+        )
+        """)
         await db.commit()
 
 asyncio.get_event_loop().run_until_complete(init_db())
 
-# ===================== PING TASK WITH FOOTER =====================
+# ===================== GIVEAWAY TIMER (RUNS ONCE) =====================
 async def wait_and_ping(message_id: int, channel_id: int, winner_id: int, end_time: datetime):
     channel = bot.get_channel(channel_id)
     if not channel:
         return
 
-    while True:
-        remaining = (end_time - datetime.utcnow()).total_seconds()
-        if remaining <= 0:
-            break
+    # wait until giveaway ends
+    remaining = (end_time - datetime.utcnow()).total_seconds()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
 
-        # Update embed footer
-        try:
-            msg = await channel.fetch_message(message_id)
-            embed = msg.embeds[0]
-            hours, remainder = divmod(int(remaining), 3600)
-            minutes, seconds = divmod(remainder, 60)
-            embed.set_footer(text=f"Time remaining: {hours}h {minutes}m {seconds}s")
-            await msg.edit(embed=embed)
-        except Exception:
-            pass
-
-        await asyncio.sleep(5)  # update every 5 seconds
-
-    # Time's up, ping winner
-    await channel.send(f"<@{winner_id}> You won! 🎉")
-
-    # Remove from DB
+    # prevent duplicate wins
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM autopings WHERE message_id = ?", (message_id,))
+        async with db.execute(
+            "SELECT ended FROM autopings WHERE message_id = ?",
+            (message_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row or row[0] == 1:
+                return
+
+        await db.execute(
+            "UPDATE autopings SET ended = 1 WHERE message_id = ?",
+            (message_id,)
+        )
+        await db.commit()
+
+    # announce winner ONCE
+    await channel.send(f"🎉 <@{winner_id}> won the giveaway!")
+
+    # cleanup
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM autopings WHERE message_id = ?",
+            (message_id,)
+        )
         await db.commit()
 
 # ===================== /GIVEAWAY COMMAND =====================
-@bot.slash_command(name="giveaway", description="Auto ping a selected user after duration")
+@bot.slash_command(name="giveaway", description="Rigged giveaway (chosen winner)")
 async def giveaway(
     interaction: Interaction,
     header: str = SlashOption(description="Giveaway header"),
-    points: str = SlashOption(description="Giveaway points/description"),
+    points: str = SlashOption(description="Giveaway points"),
     winner: nextcord.Member = SlashOption(description="Who will win"),
-    emoji: str = SlashOption(description="Emoji for reaction"),
-    duration: str = SlashOption(description="Duration e.g., 1h, 30m, 10s")
+    emoji: str = SlashOption(description="Reaction emoji"),
+    duration: str = SlashOption(description="Duration e.g. 10m, 1h, 30s")
 ):
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer()
 
-    # Calculate end time
+    # parse duration
     unit = duration[-1].lower()
     amount = int(duration[:-1])
     now = datetime.utcnow()
+
     if unit == "s":
         end_time = now + timedelta(seconds=amount)
     elif unit == "m":
@@ -98,38 +108,56 @@ async def giveaway(
     elif unit == "d":
         end_time = now + timedelta(days=amount)
     else:
-        await interaction.followup.send("Invalid duration! Use s, m, h, d")
+        await interaction.followup.send("Invalid duration. Use s/m/h/d", ephemeral=True)
         return
 
-    # Send embed with header and points
-    embed = nextcord.Embed(title=header, description=points, color=0x00ff00)
-    embed.add_field(name="React to enter :", value=emoji)
-    embed.set_footer(text=f"Time remaining: {duration}")
+    # giveaway embed ONLY
+    embed = nextcord.Embed(
+        title=header,
+        description=points,
+        color=0x00ff00
+    )
+    embed.add_field(name="React to enter:", value=emoji)
+    embed.set_footer(text=f"Ends in {duration}")
+
     msg = await interaction.channel.send(embed=embed)
     await msg.add_reaction(emoji)
 
-    # Save to DB
+    # save giveaway
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO autopings VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (msg.id, interaction.channel.id, interaction.guild.id, header, points, winner.id, emoji, end_time.isoformat())
+            "INSERT OR REPLACE INTO autopings VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (
+                msg.id,
+                interaction.channel.id,
+                interaction.guild.id,
+                header,
+                points,
+                winner.id,
+                emoji,
+                end_time.isoformat()
+            )
         )
         await db.commit()
 
-    # Start async ping task
-    bot.loop.create_task(wait_and_ping(msg.id, interaction.channel.id, winner.id, end_time))
-    await interaction.followup.send(f"Auto ping scheduled for {winner.mention}!", ephemeral=True)
+    # start timer (ONCE)
+    bot.loop.create_task(
+        wait_and_ping(msg.id, interaction.channel.id, winner.id, end_time)
+    )
 
 # ===================== RESTORE ON RESTART =====================
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT message_id, channel_id, winner_id, end_time FROM autopings") as cursor:
-            async for row in cursor:
-                message_id, channel_id, winner_id, end_time_str = row
+        async with db.execute(
+            "SELECT message_id, channel_id, winner_id, end_time FROM autopings WHERE ended = 0"
+        ) as cursor:
+            async for message_id, channel_id, winner_id, end_time_str in cursor:
                 end_time = datetime.fromisoformat(end_time_str)
-                bot.loop.create_task(wait_and_ping(message_id, channel_id, winner_id, end_time))
+                bot.loop.create_task(
+                    wait_and_ping(message_id, channel_id, winner_id, end_time)
+                )
 
 # ===================== RUN BOT =====================
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
