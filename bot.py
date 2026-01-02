@@ -1,25 +1,27 @@
 import os
 import asyncio
-import sqlite3
-import discord
-from discord import app_commands
-from discord.ext import commands
-from flask import Flask
-from threading import Thread
+import time
 from datetime import datetime, timedelta
 
-# ================== DEBUG TOKEN ==================
-print("DEBUG DISCORD_TOKEN =", repr(os.getenv("DISCORD_TOKEN")))
+import discord
+from discord.ext import commands
+from discord import app_commands
 
-# ================== CONFIG ==================
+import aiosqlite
+from flask import Flask
+from threading import Thread
+
+# ===================== CONFIG =====================
 TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN environment variable is not set")
+DB_NAME = "giveaways.db"
 
-GUILD_ID = 1418535300996530319
-DB_FILE = "giveaways.db"
+intents = discord.Intents.default()
+intents.message_content = False
+intents.reactions = True
 
-# ================== FLASK KEEP-ALIVE ==================
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ===================== FLASK (RENDER KEEPALIVE) =====================
 app = Flask(__name__)
 
 @app.route("/")
@@ -27,157 +29,118 @@ def home():
     return "Bot is alive"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=10000)
 
 Thread(target=run_flask).start()
 
-# ================== DISCORD BOT ==================
-intents = discord.Intents.none()
-intents.guilds = True
-intents.reactions = True
+# ===================== DATABASE =====================
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS giveaways (
+            giveaway_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER,
+            message_id INTEGER,
+            forced_winner_id INTEGER,
+            end_time INTEGER,
+            emoji TEXT
+        )
+        """)
+        await db.commit()
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# ===================== GIVEAWAY TASK =====================
+async def giveaway_task(giveaway_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT channel_id, message_id, forced_winner_id, end_time, emoji FROM giveaways WHERE giveaway_id = ?",
+            (giveaway_id,)
+        )
+        data = await cursor.fetchone()
 
-# ================== DATABASE ==================
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cur = conn.cursor()
+    if not data:
+        return
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS giveaways (
-    message_id INTEGER PRIMARY KEY,
-    channel_id INTEGER,
-    winner_id INTEGER,
-    end_time TEXT,
-    emoji TEXT,
-    active INTEGER
-)
-""")
-conn.commit()
+    channel_id, message_id, forced_winner_id, end_time, emoji = data
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
 
-# ================== READY ==================
-@bot.event
-async def on_ready():
-    guild = discord.Object(id=GUILD_ID)
-    bot.tree.copy_global_to(guild=guild)
-    await bot.tree.sync(guild=guild)
-    print(f"✅ Logged in as {bot.user}")
+    try:
+        message = await channel.fetch_message(message_id)
+    except:
+        return
 
-    bot.loop.create_task(resume_giveaways())
+    while time.time() < end_time:
+        remaining = int(end_time - time.time())
+        hours, rem = divmod(remaining, 3600)
+        mins, _ = divmod(rem, 60)
 
-# ================== TIME PARSER ==================
-def parse_duration(value: int, unit: str):
-    if unit == "m":
-        return timedelta(minutes=value)
-    if unit == "h":
-        return timedelta(hours=value)
-    if unit == "d":
-        return timedelta(days=value)
-    return None
+        embed = message.embeds[0]
+        embed.set_footer(text=f"⏳ Ends in: {hours}h {mins}m")
+        await message.edit(embed=embed)
 
-# ================== GIVEAWAY COMMAND ==================
-@bot.tree.command(
-    name="giveaway",
-    description="Create a forced-winner giveaway",
-    guild=discord.Object(id=GUILD_ID)
+        await asyncio.sleep(60)
+
+    # FINAL — FORCED WINNER ONLY
+    winner = channel.guild.get_member(forced_winner_id)
+    if not winner:
+        await channel.send("❌ Giveaway cancelled (forced winner not found).")
+        return
+
+    await channel.send(f"🎉 **Winner:** {winner.mention}")
+
+# ===================== SLASH COMMAND =====================
+@bot.tree.command(name="giveaway", description="Create a forced-winner giveaway")
+@app_commands.describe(
+    header="Giveaway title",
+    duration="Duration (e.g. 10m / 2h / 1d)",
+    emoji="Entry emoji",
+    winner="Forced winner (REQUIRED)"
 )
 async def giveaway(
     interaction: discord.Interaction,
-    title: str,
-    points: str,
-    duration_value: int,
-    duration_unit: str,
+    header: str,
+    duration: str,
     emoji: str,
-    winners: int,
     winner: discord.Member
 ):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.send_message("🎉 Giveaway created!", ephemeral=True)
 
-    delta = parse_duration(duration_value, duration_unit)
-    if not delta:
-        await interaction.followup.send("❌ Invalid duration unit (use m/h/d)", ephemeral=True)
-        return
+    unit = duration[-1]
+    value = int(duration[:-1])
 
-    end_time = datetime.utcnow() + delta
+    seconds = {"m": 60, "h": 3600, "d": 86400}[unit] * value
+    end_time = int(time.time() + seconds)
 
     embed = discord.Embed(
-        title=title,
+        title=header,
         description=(
-            f"{points}\n\n"
-            f"🏆 **Winners:** {winners}\n"
-            f"⏰ Ends <t:{int(end_time.timestamp())}:R>\n\n"
-            f"React with {emoji} to enter!"
+            f"• **Winner:** {winner.mention} (FIXED)\n"
+            f"• React with {emoji} to enter\n\n"
+            f"🏆 **Winners:** 1"
         ),
-        color=0x2F3136
+        color=0x2f3136
     )
+    embed.set_footer(text="⏳ Calculating...")
 
-    try:
-        message = await interaction.channel.send(embed=embed)
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "❌ I need **Send Messages** and **Embed Links** permissions.",
-            ephemeral=True
+    msg = await interaction.channel.send(embed=embed)
+    await msg.add_reaction(emoji)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "INSERT INTO giveaways (channel_id, message_id, forced_winner_id, end_time, emoji) VALUES (?, ?, ?, ?, ?)",
+            (interaction.channel.id, msg.id, winner.id, end_time, emoji)
         )
-        return
+        giveaway_id = cursor.lastrowid
+        await db.commit()
 
-    try:
-        await message.add_reaction(emoji)
-    except discord.Forbidden:
-        pass
+    asyncio.create_task(giveaway_task(giveaway_id))
 
-    cur.execute(
-        "INSERT INTO giveaways VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            message.id,
-            interaction.channel.id,
-            winner.id,
-            end_time.isoformat(),
-            emoji,
-            1
-        )
-    )
-    conn.commit()
+# ===================== READY =====================
+@bot.event
+async def on_ready():
+    await init_db()
+    await bot.tree.sync()
+    print(f"Logged in as {bot.user}")
 
-    bot.loop.create_task(run_giveaway(message.id))
-    await interaction.followup.send("✅ Giveaway created (winner locked).", ephemeral=True)
-
-# ================== GIVEAWAY RUNNER ==================
-async def run_giveaway(message_id: int):
-    while True:
-        cur.execute(
-            "SELECT channel_id, winner_id, end_time, active FROM giveaways WHERE message_id = ?",
-            (message_id,)
-        )
-        row = cur.fetchone()
-
-        if not row:
-            return
-
-        channel_id, winner_id, end_time, active = row
-        if not active:
-            return
-
-        if datetime.fromisoformat(end_time) <= datetime.utcnow():
-            break
-
-        await asyncio.sleep(30)
-
-    cur.execute("UPDATE giveaways SET active = 0 WHERE message_id = ?", (message_id,))
-    conn.commit()
-
-    channel = bot.get_channel(channel_id)
-    if channel:
-        try:
-            user = await bot.fetch_user(winner_id)
-            await channel.send(f"🎉 Congratulations {user.mention}! You won the giveaway!")
-        except:
-            pass
-
-# ================== RESUME ==================
-async def resume_giveaways():
-    await bot.wait_until_ready()
-    cur.execute("SELECT message_id FROM giveaways WHERE active = 1")
-    for (message_id,) in cur.fetchall():
-        bot.loop.create_task(run_giveaway(message_id))
-
-# ================== RUN ==================
 bot.run(TOKEN)
