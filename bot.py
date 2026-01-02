@@ -159,6 +159,44 @@ async def on_ready():
                     wait_and_ping(message_id, channel_id, winner_id, end_time)
                 )
 
+# ===================== /USE_AFTER_GIVEAWAY COMMAND =====================
+@bot.slash_command(
+    name="use_after_giveaway",
+    description="Nuke the channel after a giveaway"
+)
+async def use_after_giveaway(interaction: Interaction):
+
+    # Permission check
+    if not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message(
+            "❌ You need **Manage Messages** permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        "💣 Nuking channel...", ephemeral=True
+    )
+
+    channel = interaction.channel
+
+    # Delete all messages
+    async for message in channel.history(limit=None):
+        try:
+            await message.delete()
+            await asyncio.sleep(0.25)  # prevent rate limits
+        except:
+            pass
+
+    # Send nuke embed
+    embed = nextcord.Embed(
+        title="💥 Channel Nuked",
+        description=f"This channel has been nuked by {interaction.user.mention}",
+        color=nextcord.Color.from_rgb(0, 0, 0)  # black
+    )
+
+    await channel.send(embed=embed)
+    
 # ===================== RUN BOT =====================
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 bot.run(DISCORD_TOKEN)
