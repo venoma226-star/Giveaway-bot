@@ -8,9 +8,15 @@ from flask import Flask
 from threading import Thread
 from datetime import datetime, timedelta
 
+# ================== DEBUG TOKEN ==================
+print("DEBUG DISCORD_TOKEN =", repr(os.getenv("DISCORD_TOKEN")))
+
 # ================== CONFIG ==================
-TOKEN = os.getenv("DISCORD_TOKEN")  # set in Render
-GUILD_ID = 1418535300996530319      # your server
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN environment variable is not set")
+
+GUILD_ID = 1418535300996530319
 DB_FILE = "giveaways.db"
 
 # ================== FLASK KEEP-ALIVE ==================
@@ -69,15 +75,10 @@ def parse_duration(value: int, unit: str):
     return None
 
 # ================== GIVEAWAY COMMAND ==================
-@bot.tree.command(name="giveaway", description="Create a forced-winner giveaway", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(
-    title="Giveaway title",
-    points="Giveaway description / points",
-    duration_value="Duration number",
-    duration_unit="m / h / d",
-    emoji="Emoji to enter",
-    winners="Number of winners (display only)",
-    winner="User who WILL win"
+@bot.tree.command(
+    name="giveaway",
+    description="Create a forced-winner giveaway",
+    guild=discord.Object(id=GUILD_ID)
 )
 async def giveaway(
     interaction: discord.Interaction,
@@ -100,10 +101,12 @@ async def giveaway(
 
     embed = discord.Embed(
         title=title,
-        description=f"{points}\n\n"
-                    f"🏆 **Winners:** {winners}\n"
-                    f"⏰ Ends <t:{int(end_time.timestamp())}:R>\n\n"
-                    f"React with {emoji} to enter!",
+        description=(
+            f"{points}\n\n"
+            f"🏆 **Winners:** {winners}\n"
+            f"⏰ Ends <t:{int(end_time.timestamp())}:R>\n\n"
+            f"React with {emoji} to enter!"
+        ),
         color=0x2F3136
     )
 
@@ -111,8 +114,7 @@ async def giveaway(
         message = await interaction.channel.send(embed=embed)
     except discord.Forbidden:
         await interaction.followup.send(
-            "❌ I don't have permission to send messages here.\n"
-            "Give **Send Messages** + **Embed Links**.",
+            "❌ I need **Send Messages** and **Embed Links** permissions.",
             ephemeral=True
         )
         return
@@ -141,43 +143,40 @@ async def giveaway(
 # ================== GIVEAWAY RUNNER ==================
 async def run_giveaway(message_id: int):
     while True:
-        cur.execute("SELECT channel_id, winner_id, end_time, emoji, active FROM giveaways WHERE message_id = ?", (message_id,))
+        cur.execute(
+            "SELECT channel_id, winner_id, end_time, active FROM giveaways WHERE message_id = ?",
+            (message_id,)
+        )
         row = cur.fetchone()
 
         if not row:
             return
 
-        channel_id, winner_id, end_time, emoji, active = row
+        channel_id, winner_id, end_time, active = row
         if not active:
             return
 
-        remaining = datetime.fromisoformat(end_time) - datetime.utcnow()
-        if remaining.total_seconds() <= 0:
+        if datetime.fromisoformat(end_time) <= datetime.utcnow():
             break
 
         await asyncio.sleep(30)
 
-    # END GIVEAWAY
     cur.execute("UPDATE giveaways SET active = 0 WHERE message_id = ?", (message_id,))
     conn.commit()
 
     channel = bot.get_channel(channel_id)
-    if not channel:
-        return
+    if channel:
+        try:
+            user = await bot.fetch_user(winner_id)
+            await channel.send(f"🎉 Congratulations {user.mention}! You won the giveaway!")
+        except:
+            pass
 
-    try:
-        winner_user = await bot.fetch_user(winner_id)
-        await channel.send(f"🎉 Congratulations {winner_user.mention}! You won the giveaway!")
-    except:
-        pass
-
-# ================== RESUME ON RESTART ==================
+# ================== RESUME ==================
 async def resume_giveaways():
     await bot.wait_until_ready()
     cur.execute("SELECT message_id FROM giveaways WHERE active = 1")
-    rows = cur.fetchall()
-
-    for (message_id,) in rows:
+    for (message_id,) in cur.fetchall():
         bot.loop.create_task(run_giveaway(message_id))
 
 # ================== RUN ==================
