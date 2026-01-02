@@ -103,7 +103,7 @@ async def giveaway(
 
     # Send embed with header and points
     embed = nextcord.Embed(title=header, description=points, color=0x00ff00)
-    embed.add_field(name="React to enter (for fun):", value=emoji)
+    embed.add_field(name="React to enter :", value=emoji)
     embed.set_footer(text=f"Time remaining: {duration}")
     msg = await interaction.channel.send(embed=embed)
     await msg.add_reaction(emoji)
