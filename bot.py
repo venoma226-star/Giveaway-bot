@@ -1,41 +1,31 @@
-# bot.py
 import os
 import asyncio
 from datetime import datetime, timedelta
 import nextcord
-from nextcord import Interaction, SlashOption
 from nextcord.ext import commands
 import aiosqlite
-from flask import Flask
-from threading import Thread
-
-# ===================== FLASK KEEPALIVE =====================
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot is alive"
-
-Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 
 # ===================== BOT SETUP =====================
 intents = nextcord.Intents.default()
-bot = commands.Bot(intents=intents)
+intents.message_content = True
+intents.reactions = True
 
-DB_PATH = "autopinger.db"
+bot = commands.Bot(command_prefix="!", intents=intents)
+DB_PATH = "giveaways.db"
+
+NEON = nextcord.Color.from_rgb(138, 43, 226)  # neon purple
 
 # ===================== DATABASE =====================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS autopings (
+        CREATE TABLE IF NOT EXISTS giveaways (
             message_id INTEGER PRIMARY KEY,
+            timer_message_id INTEGER,
             channel_id INTEGER,
-            guild_id INTEGER,
-            header TEXT,
-            points TEXT,
-            winner_id INTEGER,
+            winner_ids TEXT,
             emoji TEXT,
+            start_time TEXT,
             end_time TEXT,
             ended INTEGER DEFAULT 0
         )
@@ -44,105 +34,169 @@ async def init_db():
 
 asyncio.get_event_loop().run_until_complete(init_db())
 
-# ===================== GIVEAWAY TIMER (RUNS ONCE) =====================
-async def wait_and_ping(message_id: int, channel_id: int, winner_id: int, end_time: datetime):
-    channel = bot.get_channel(channel_id)
+# ===================== UTILS =====================
+def parse_duration(text: str):
+    unit = text[-1].lower()
+    value = int(text[:-1])
+    return {
+        "s": timedelta(seconds=value),
+        "m": timedelta(minutes=value),
+        "h": timedelta(hours=value),
+        "d": timedelta(days=value)
+    }.get(unit)
+
+def progress_bar(percent, size=14):
+    filled = int(size * percent)
+    return "█" * filled + "░" * (size - filled)
+
+def format_time(seconds):
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+# ===================== GIVEAWAY TIMER =====================
+async def giveaway_timer(gid, tid, cid, winners, emoji, start, end):
+    channel = bot.get_channel(cid)
     if not channel:
         return
 
-    # wait until giveaway ends
-    remaining = (end_time - datetime.utcnow()).total_seconds()
-    if remaining > 0:
-        await asyncio.sleep(remaining)
+    total = (end - start).total_seconds()
 
-    # prevent duplicate wins
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT ended FROM autopings WHERE message_id = ?",
-            (message_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row or row[0] == 1:
-                return
+    while True:
+        now = datetime.utcnow()
+        remaining = int((end - now).total_seconds())
+        if remaining <= 0:
+            break
 
-        await db.execute(
-            "UPDATE autopings SET ended = 1 WHERE message_id = ?",
-            (message_id,)
+        percent = 1 - (remaining / total)
+        bar = progress_bar(percent)
+
+        # Count entries from reactions
+        try:
+            gmsg = await channel.fetch_message(gid)
+            reaction = next((r for r in gmsg.reactions if str(r.emoji) == emoji), None)
+            entries = max(0, reaction.count - 1) if reaction else 0
+        except:
+            entries = 0
+
+        embed = nextcord.Embed(
+            title="⚡ Giveaway Timer",
+            description=(
+                f"⏳ **Time Left:** `{format_time(remaining)}`\n"
+                f"👥 **Entries:** `{entries}`\n\n"
+                f"`{bar}`\n\n"
+                f"🎯 React with {emoji} to enter"
+            ),
+            color=NEON
         )
+        embed.set_footer(text="Powered by Jordan Bot ⚡")
+
+        try:
+            tmsg = await channel.fetch_message(tid)
+            await tmsg.edit(embed=embed)
+        except:
+            pass
+
+        await asyncio.sleep(5)
+
+    # ===================== END =====================
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE giveaways SET ended = 1 WHERE message_id = ?", (gid,))
         await db.commit()
 
-    # announce winner ONCE
-    await channel.send(f"🎉 <@{winner_id}> won the giveaway!")
+    # Update original giveaway embed footer to Ended
+    try:
+        gmsg = await channel.fetch_message(gid)
+        ended_embed = gmsg.embeds[0]
+        ended_embed.set_footer(text="Ended • Powered by Jordan Bot ⚡")
+        await gmsg.edit(embed=ended_embed)
+    except:
+        pass
 
-    # cleanup
+    mentions = ", ".join(f"<@{w}>" for w in winners)
+
+    end_embed = nextcord.Embed(
+        title="🎉 Giveaway Ended",
+        description=f"🏆 **Winner(s):** {mentions}",
+        color=NEON
+    )
+    end_embed.set_footer(text="Powered by Jordan Bot ⚡")
+
+    await channel.send(embed=end_embed)
+
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM autopings WHERE message_id = ?",
-            (message_id,)
-        )
+        await db.execute("DELETE FROM giveaways WHERE message_id = ?", (gid,))
         await db.commit()
 
-# ===================== /GIVEAWAY COMMAND =====================
-@bot.slash_command(name="giveaway", description="Rigged giveaway (chosen winner)")
-async def giveaway(
-    interaction: Interaction,
-    header: str = SlashOption(description="Giveaway header"),
-    points: str = SlashOption(description="Giveaway points"),
-    winner: nextcord.Member = SlashOption(description="Who will win"),
-    emoji: str = SlashOption(description="Reaction emoji"),
-    duration: str = SlashOption(description="Duration e.g. 10m, 1h, 30s")
-):
-    await interaction.response.defer()
+# ===================== GIVEAWAY COMMAND =====================
+@bot.command(name="giveawaystart")
+@commands.has_permissions(manage_messages=True)
+async def giveawaystart(ctx, time: str, *, data: str):
+    parts = [p.strip() for p in data.split("|")]
 
-    # parse duration
-    unit = duration[-1].lower()
-    amount = int(duration[:-1])
-    now = datetime.utcnow()
-
-    if unit == "s":
-        end_time = now + timedelta(seconds=amount)
-    elif unit == "m":
-        end_time = now + timedelta(minutes=amount)
-    elif unit == "h":
-        end_time = now + timedelta(hours=amount)
-    elif unit == "d":
-        end_time = now + timedelta(days=amount)
-    else:
-        await interaction.followup.send("Invalid duration. Use s/m/h/d", ephemeral=True)
+    if len(parts) < 3:
+        await ctx.send("❌ Invalid format.")
         return
 
-    # giveaway embed ONLY
+    *description, emoji, _ = parts
+    winners = [m.id for m in ctx.message.mentions]
+
+    if not winners:
+        await ctx.send("❌ You must mention at least one winner.")
+        return
+
+    duration = parse_duration(time)
+    if not duration:
+        await ctx.send("❌ Invalid time. Use s/m/h/d")
+        return
+
+    start = datetime.utcnow()
+    end = start + duration
+
     embed = nextcord.Embed(
-        title=header,
-        description=points,
-        color=0x00ff00
+        title="⚡ Giveaway",
+        description="\n".join(description),
+        color=NEON
     )
-    embed.add_field(name="React to enter:", value=emoji)
-    embed.set_footer(text=f"Ends in {duration}")
+    embed.add_field(name="How to Enter", value=f"React with {emoji}")
+    embed.set_footer(text="Powered by Jordan Bot ⚡")
 
-    msg = await interaction.channel.send(embed=embed)
-    await msg.add_reaction(emoji)
+    gmsg = await ctx.send(embed=embed)
+    await gmsg.add_reaction(emoji)
 
-    # save giveaway
+    tembed = nextcord.Embed(
+        title="⏳ Giveaway Timer",
+        description="Starting...",
+        color=NEON
+    )
+    tembed.set_footer(text="Powered by Jordan Bot ⚡")
+
+    tmsg = await ctx.send(embed=tembed)
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO autopings VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            "INSERT INTO giveaways VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
             (
-                msg.id,
-                interaction.channel.id,
-                interaction.guild.id,
-                header,
-                points,
-                winner.id,
+                gmsg.id,
+                tmsg.id,
+                ctx.channel.id,
+                ",".join(map(str, winners)),
                 emoji,
-                end_time.isoformat()
+                start.isoformat(),
+                end.isoformat()
             )
         )
         await db.commit()
 
-    # start timer (ONCE)
     bot.loop.create_task(
-        wait_and_ping(msg.id, interaction.channel.id, winner.id, end_time)
+        giveaway_timer(gmsg.id, tmsg.id, ctx.channel.id, winners, emoji, start, end)
     )
 
 # ===================== RESTORE ON RESTART =====================
@@ -151,52 +205,20 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT message_id, channel_id, winner_id, end_time FROM autopings WHERE ended = 0"
+            "SELECT message_id, timer_message_id, channel_id, winner_ids, emoji, start_time, end_time FROM giveaways WHERE ended = 0"
         ) as cursor:
-            async for message_id, channel_id, winner_id, end_time_str in cursor:
-                end_time = datetime.fromisoformat(end_time_str)
+            async for mid, tid, cid, wids, emoji, s, e in cursor:
                 bot.loop.create_task(
-                    wait_and_ping(message_id, channel_id, winner_id, end_time)
+                    giveaway_timer(
+                        mid,
+                        tid,
+                        cid,
+                        list(map(int, wids.split(","))),
+                        emoji,
+                        datetime.fromisoformat(s),
+                        datetime.fromisoformat(e)
+                    )
                 )
 
-# ===================== /USE_AFTER_GIVEAWAY COMMAND =====================
-@bot.slash_command(
-    name="use_after_giveaway",
-    description="Nuke the channel after a giveaway"
-)
-async def use_after_giveaway(interaction: Interaction):
-
-    # Permission check
-    if not interaction.user.guild_permissions.manage_messages:
-        await interaction.response.send_message(
-            "❌ You need **Manage Messages** permission to use this command.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message(
-        "💣 Nuking channel...", ephemeral=True
-    )
-
-    channel = interaction.channel
-
-    # Delete all messages
-    async for message in channel.history(limit=None):
-        try:
-            await message.delete()
-            await asyncio.sleep(0.25)  # prevent rate limits
-        except:
-            pass
-
-    # Send nuke embed
-    embed = nextcord.Embed(
-        title="💥 Channel Nuked",
-        description=f"This channel has been nuked by {interaction.user.mention}",
-        color=nextcord.Color.from_rgb(0, 0, 0)  # black
-    )
-
-    await channel.send(embed=embed)
-    
-# ===================== RUN BOT =====================
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-bot.run(DISCORD_TOKEN)
+# ===================== RUN =====================
+bot.run(os.environ["DISCORD_TOKEN"])
