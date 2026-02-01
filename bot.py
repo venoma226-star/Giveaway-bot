@@ -122,16 +122,9 @@ async def giveaway_timer(gid, tid, cid, winners, emoji, start, end):
     except:
         pass
 
+    # Send end message as plain text (no embed)
     mentions = ", ".join(f"<@{w}>" for w in winners)
-
-    end_embed = nextcord.Embed(
-        title="🎉 Giveaway Ended",
-        description=f"🏆 **Winner(s):** {mentions}",
-        color=NEON
-    )
-    end_embed.set_footer(text="Powered by Jordan Bot ⚡")
-
-    await channel.send(embed=end_embed)
+    await channel.send(f"🎉 Giveaway Ended!\n🏆 Winner(s): {mentions}\n⚡ Powered by Jordan Bot")
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM giveaways WHERE message_id = ?", (gid,))
