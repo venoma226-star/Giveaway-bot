@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 import nextcord
 from nextcord.ext import commands
 import aiosqlite
+from flask import Flask
+import threading
 
 # ===================== BOT SETUP =====================
 intents = nextcord.Intents.default()
@@ -220,5 +222,19 @@ async def on_ready():
                     )
                 )
 
-# ===================== RUN =====================
+# ===================== FLASK KEEP-ALIVE =====================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Discord Giveaway Bot is running! ⚡"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+# Start Flask server in background thread
+threading.Thread(target=run_flask, daemon=True).start()
+
+# ===================== RUN BOT =====================
 bot.run(os.environ["DISCORD_TOKEN"])
